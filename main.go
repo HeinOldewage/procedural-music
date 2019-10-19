@@ -6,11 +6,12 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"os"
 	"time"
 
 	"github.com/faiface/beep"
-	"github.com/faiface/beep/effects"
 	"github.com/faiface/beep/speaker"
+	"github.com/faiface/beep/wav"
 )
 
 var (
@@ -32,23 +33,38 @@ var (
 type CNote struct {
 	SampleRate beep.SampleRate
 	Frequency  float64
+	Volume     float64
 	Duration   time.Duration
 	position   int64
 }
 
 func (no *CNote) Stream(samples [][2]float64) (n int, ok bool) {
-	if no.position >= int64(no.SampleRate.N(no.Duration)) {
+	var fadeVolume float64 = 0
+	totalSamples := int64(no.SampleRate.N(no.Duration))
+	if no.position >= totalSamples {
 		return 0, false
 	}
+	var numCylcesToFade float64 = 4
+	oneCycle := float64(no.SampleRate.N(time.Duration(1 / no.Frequency * float64(time.Second))))
+	totalFadeCycles := oneCycle * numCylcesToFade
+
 	for i := range samples {
 		x := math.Sin(no.Frequency * 2 * math.Pi * float64(no.position) / float64(no.SampleRate))
 
-		if no.position >= int64(no.SampleRate.N(no.Duration)) {
+		if float64(totalSamples-no.position) < totalFadeCycles {
+			fadeVolume = -(totalFadeCycles - float64(totalSamples-no.position)) / totalFadeCycles
+		}
+		if float64(no.position) < totalFadeCycles {
+			fadeVolume = -(totalFadeCycles - float64(no.position)) / totalFadeCycles
+		}
+
+		if no.position >= totalSamples {
 			return i, false
+
 		}
 		no.position++
-		samples[i][0] = x
-		samples[i][1] = x
+		samples[i][0] = x * math.Pow(2, no.Volume+fadeVolume*4)
+		samples[i][1] = x * math.Pow(2, no.Volume+fadeVolume*4)
 	}
 	return len(samples), true
 }
@@ -62,15 +78,23 @@ func (n *CNote) Reset() {
 }
 
 func (no *CNote) For(dur time.Duration) *CNote {
-	res := *no
-
 	extraTime := dur % time.Duration(1/no.Frequency*float64(time.Second))
-	res.Duration = dur - extraTime
-	return &res
+	no.Duration = dur - extraTime
+	return no
+}
+
+func (no *CNote) AtVolume(vol float64) *CNote {
+	no.Volume = vol
+	return no
 }
 
 func (no *CNote) String() string {
 	return fmt.Sprint(no.Frequency)
+}
+
+func (no *CNote) Copy() *CNote {
+	res := *no
+	return &res
 }
 
 type Rest struct {
@@ -131,7 +155,19 @@ type Note interface {
 	Reset()
 }
 
-func Notes(scale []int) chan Note {
+func UpDown(notes []*CNote) chan Note {
+	res := make(chan Note)
+	go func() {
+		for {
+			for _, note := range notes {
+				res <- note.For(time.Millisecond * 500)
+			}
+		}
+	}()
+	return res
+}
+
+func Notes(scale []int, numNotes int) chan Note {
 	notes := make(chan Note)
 	rest := &Rest{SampleRate: beep.SampleRate(441000)}
 	go func() {
@@ -143,8 +179,23 @@ func Notes(scale []int) chan Note {
 		}
 		ourNotes = append(ourNotes, allNotes[nextNote])
 		currentNote := rand.Intn(len(ourNotes))
-		for {
-			notes <- ourNotes[currentNote].For(time.Millisecond * 100)
+		noteCounter := 0
+		for noteCounter < numNotes {
+
+			var volume float64 = -3
+
+			switch (noteCounter) % 4 {
+			case 0:
+				volume = -3
+			case 2:
+				volume = -3
+			}
+
+			noteCounter++
+
+			note := ourNotes[currentNote].Copy().For(time.Millisecond * 100).AtVolume(volume)
+
+			notes <- note
 			notes <- rest.For(time.Millisecond * 150)
 
 			noteRange := 3
@@ -226,15 +277,19 @@ func Song(phraseCount int, phrases chan func(chan beep.Streamer)) func(chan beep
 	return func(song chan beep.Streamer) {
 		go func() {
 			for {
+				log.Println("Playing song")
 				for i := 0; i < phraseCount; i++ {
-					log.Println("Playing prase")
+					log.Println("Playing phrase")
 					(<-phrases)(song)
 				}
-				song <- &Rest{SampleRate: beep.SampleRate(441000), Duration: time.Millisecond * 100}
+				song <- &Rest{SampleRate: beep.SampleRate(441000), Duration: time.Millisecond * 1000}
 			}
 		}()
 	}
 }
+
+var debug = flag.Bool("debug", false, "debug")
+var save = flag.Bool("save", false, "save")
 
 func main() {
 
@@ -243,49 +298,52 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 
 	sr := beep.SampleRate(441000)
-	format := beep.Format{SampleRate: sr, NumChannels: 2, Precision: 6}
+	format := beep.Format{SampleRate: sr, NumChannels: 2, Precision: 2}
 
 	speaker.Init(format.SampleRate, format.SampleRate.N(time.Millisecond*50))
 
 	song := make(chan beep.Streamer)
 
-	Song(10, Phrases(2, 2, 4, Bars(8, Notes(scaleMajor))))(song)
+	var noteSource chan Note
+	noteSource = Notes(scaleMelodicMinorDown, 8*4*1)
+	if *debug {
+		noteSource = UpDown([]*CNote{C4, C4})
+	}
 
-	noteCounter := 0
+	Song(10, Phrases(2, 2, 4, Bars(4, noteSource)))(song)
+
 	var currentStreamer beep.Streamer = &Rest{}
-	speaker.Play(beep.StreamerFunc(func(samples [][2]float64) (int, bool) {
+	streamer := beep.StreamerFunc(func(samples [][2]float64) (int, bool) {
 		total := 0
 		for i := range samples {
 			samples[i][0] = 0
 			samples[i][1] = 0
 		}
-		if true {
-			for total < len(samples) {
-				n, ok := currentStreamer.Stream(samples[total:])
-				total += n
-				if !ok {
-					note := <-song
-
-					var volume float64 = -10
-
-					switch (noteCounter / 2) % 4 {
-					case 0:
-						volume = 0.1
-					case 2:
-						volume = 0.2
-					}
-
-					noteCounter++
-
-					currentStreamer = note
-					if false {
-						currentStreamer = &effects.Volume{Streamer: note, Base: 2, Volume: volume}
-					}
+		for total < len(samples) {
+			n, ok := currentStreamer.Stream(samples[total:])
+			total += n
+			if !ok {
+				select {
+				case currentStreamer = <-song:
+				case <-time.NewTimer(time.Second).C:
+					return total, false
 				}
+
 			}
+
 		}
 		return total, true
-	}))
+	})
+	if !*save {
+		speaker.Play(streamer)
+		select {}
+	} else {
+		file, err := os.Create("out.wav")
+		if err != nil {
+			panic(err)
+		}
+		defer file.Close()
+		wav.Encode(file, streamer, format)
+	}
 
-	select {}
 }
