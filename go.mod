@@ -1,4 +1,4 @@
-module autoGenerateSound
+module procedural-music
 
 go 1.12
 
